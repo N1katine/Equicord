@@ -11,7 +11,7 @@ import definePlugin from "@utils/types";
 import type { User } from "@vencord/discord-types";
 import { FluxDispatcher, Menu, SelectedChannelStore } from "@webpack/common";
 
-import { getActiveP2PStream, getGoLiveSource, getP2PStream, interceptStreamActions, isActiveP2PKey, isLive, isP2PStream, myStream, onVoiceChannel, p2pRoute, stopStream, stopWatcher, unwatch, useP2P, usePreview, useStreaming, useWatchingIn } from "./net";
+import { activeP2PStreams, getActiveP2PStream, getGoLiveSource, getP2PStream, interceptStreamActions, isActiveP2PKey, isLive, isP2PStream, isPreexistingLive, liveOwnersIn, myStream, onVoiceChannel, p2pRoute, P2PStore, p2pViewerIds, stopStream, stopWatcher, unwatch, useP2P, usePreview, useStreaming, useWatchingIn } from "./net";
 import { renderTile, startWatching } from "./ui";
 
 const userContext: NavContextMenuPatchCallback = (children, { user }: { user?: User; }) => {
@@ -199,6 +199,31 @@ export default definePlugin({
                 match: /(function \i\(\i,\i,\i,\i,\i,\i\)\{)(?=if\(\i===\i\.\i\.PRESET_AUTO\))/,
                 replace: "$1if($self.p2pRoute())return!0;"
             }
+        },
+        {
+            find: 'return"stream_user_left"',
+            replacement: [
+                {
+                    match: /\[(\i\.\i,\i\.\i,\i\.default,\i\.\i,\i\.\i,\i\.\i\],\(\)=>\{let \i,\i,\i=\i\.\i\.getVoiceChannelId\(\),\i=\i\.default\.getId\(\),\i=\[\],\i=null,\i=0,\i=!1,\i=\[\],\i=\i\.\i\.getAllActiveStreams\(\))/,
+                    replace: "[$self.P2PStore,$1.concat($self.activeP2PStreams())"
+                },
+                {
+                    match: /(isInChannel\(\i\.id\),\i=\i\.\i\.getAllApplicationStreamsForChannel\((\i)\.id\)\.map\(\i=>\i\.ownerId\))/,
+                    replace: "$1.concat($self.liveOwnersIn($2.id))"
+                },
+                {
+                    match: /(1===(\i)\.length\?\2\[0\]:)(\i\.\i\.getCurrentUserActiveStream\(\))/,
+                    replace: "$1($3??$self.myStream())"
+                },
+                {
+                    match: /(\i=)(\i\.\i)\.getViewerIds\((\i)\)(?=\.filter\(\i=>\i!==\i\)\.length\),\{channelType:)/,
+                    replace: "$1($self.p2pViewerIds($3)??$2.getViewerIds($3))"
+                },
+                {
+                    match: /(\i\.some\((\i)=>!\i\.streamingUserIds\.includes\(\2\))/,
+                    replace: "$1&&!$self.isPreexistingLive($2)"
+                }
+            ]
         }
     ],
 
@@ -218,6 +243,11 @@ export default definePlugin({
     getActiveP2PStream,
     isActiveP2PKey,
     renderTile,
+    P2PStore,
+    activeP2PStreams,
+    liveOwnersIn,
+    p2pViewerIds,
+    isPreexistingLive,
 
     contextMenus: {
         "user-context": userContext

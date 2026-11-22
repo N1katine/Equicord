@@ -4,12 +4,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { proxyLazy } from "@utils/lazy";
 import { Logger } from "@utils/Logger";
 import { useForceUpdater } from "@utils/react";
 import { PluginNative } from "@utils/types";
 import { ApplicationStreamPresets } from "@vencord/discord-types/enums";
 import { findLazy } from "@webpack";
-import { ApplicationStreamingSettingsStore, ChannelStore, FluxDispatcher, SelectedChannelStore, showToast, useEffect, UserStore, VoiceStateStore } from "@webpack/common";
+import { ApplicationStreamingSettingsStore, ChannelStore, Flux, FluxDispatcher, SelectedChannelStore, showToast, useEffect, UserStore, VoiceStateStore } from "@webpack/common";
 
 type Message = { t: "state"; viewers: string[]; } | { t: "preview"; img: string; } | { t: "watch"; } | { t: "unwatch"; };
 
@@ -61,6 +62,7 @@ interface Live {
     conn: DataConnection;
     viewers: string[];
     preview?: string;
+    preexisting: boolean;
 }
 
 export interface Watching {
@@ -116,7 +118,11 @@ let pendingSource: { id: string; name?: string; } | undefined;
 let recaptureQueue: Promise<void> = Promise.resolve();
 
 const listeners = new Set<() => void>();
-const notify = () => listeners.forEach(l => l());
+export const P2PStore = proxyLazy(() => new (class P2PScreenShareStore extends Flux.Store { })(FluxDispatcher));
+const notify = () => {
+    listeners.forEach(l => l());
+    P2PStore.emitChange();
+};
 
 function useNotify() {
     const rerender = useForceUpdater();
@@ -167,6 +173,19 @@ export function getP2PStream(userId: string, channelId: string) {
     const liveHere = userId === me() ? streamChannelId === channelId : live.has(userId) && watcherChannelId === channelId;
     const endedHere = watching?.userId === userId && watching.ended && watching.channelId === channelId;
     return liveHere || endedHere ? streamFor(channelId, userId) : null;
+}
+
+export const liveOwnersIn = (channelId: string) => [
+    ...(streamChannelId === channelId ? [me()] : []),
+    ...(watcherChannelId === channelId ? live.keys() : [])
+];
+export const activeP2PStreams = () => [myStream(), watching && streamFor(watching.channelId, watching.userId)].filter(s => s != null);
+export const isPreexistingLive = (userId: string) => !!live.get(userId)?.preexisting;
+
+export function p2pViewerIds(key: string) {
+    if (!isActiveP2PKey(key)) return;
+    const { ownerId } = parseKey(key);
+    return ownerId === me() ? [...viewers.keys()] : live.get(ownerId)?.viewers ?? [];
 }
 
 export function getActiveP2PStream(participant: { stream: Stream; }) {
@@ -582,11 +601,11 @@ export function interceptStreamActions(action: StreamAction) {
     return false;
 }
 
-function attachLive(conn: DataConnection, userId: string, channelId: string) {
+function attachLive(conn: DataConnection, userId: string, channelId: string, preexisting: boolean) {
     conn.on("open", () => {
         const old = live.get(userId);
         if (prefersExisting(old?.conn, conn)) return conn.close();
-        live.set(userId, { conn, viewers: old?.viewers ?? [], preview: old?.preview });
+        live.set(userId, { conn, viewers: old?.viewers ?? [], preview: old?.preview, preexisting: old?.preexisting ?? preexisting });
         if (old && old.conn !== conn) old.conn.close();
         else refresh(userId, channelId);
         notify();
@@ -615,7 +634,7 @@ function probe() {
     for (const userId of Object.keys(VoiceStateStore.getVoiceStatesForChannel(channelId))) {
         if (userId === me() || live.has(userId)) continue;
         const conn = dial(w, peerId(channelId, userId));
-        if (conn) attachLive(conn, userId, channelId);
+        if (conn) attachLive(conn, userId, channelId, true);
     }
 }
 
@@ -647,7 +666,7 @@ function createWatcher(Peer: PeerCtor, channelId: string, token: number, named: 
     w.on("connection", conn => {
         const [prefix, chan, userId] = conn.peer.split("-");
         if (prefix !== "eqshare" || chan !== channelId || !VoiceStateStore.getVoiceStateForChannel(channelId, userId)) return conn.close();
-        attachLive(conn, userId, channelId);
+        attachLive(conn, userId, channelId, false);
     });
     w.on("call", call => {
         const userId = call.peer.split("-")[2];
