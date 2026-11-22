@@ -199,13 +199,6 @@ export default definePlugin({
                 match: /(function \i\(\i,\i,\i,\i,\i,\i\)\{)(?=if\(\i===\i\.\i\.PRESET_AUTO\))/,
                 replace: "$1if($self.p2pRoute())return!0;"
             }
-        },
-        {
-            find: 'name:"2026-05-frontier-tuning"',
-            replacement: {
-                match: /(function \i\(\i,\i,\i\)\{)(?=if\(null==\i\|\|)/,
-                replace: "$1if($self.p2pRoute())return null;"
-            }
         }
     ],
 
