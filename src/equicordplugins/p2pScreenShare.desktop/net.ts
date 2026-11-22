@@ -7,6 +7,7 @@
 import { Logger } from "@utils/Logger";
 import { useForceUpdater } from "@utils/react";
 import { PluginNative } from "@utils/types";
+import { ApplicationStreamPresets } from "@vencord/discord-types/enums";
 import { findLazy } from "@webpack";
 import { ApplicationStreamingSettingsStore, ChannelStore, FluxDispatcher, SelectedChannelStore, showToast, useEffect, UserStore, VoiceStateStore } from "@webpack/common";
 
@@ -32,13 +33,19 @@ interface MediaConnection {
     on(event: "close", cb: () => void): void;
 }
 
+type PeerError = { type: string; message: string; };
+
 interface Peer {
-    on(event: "open", cb: () => void): void;
+    open: boolean;
+    disconnected: boolean;
+    destroyed: boolean;
+    on(event: "open" | "disconnected", cb: () => void): void;
     on(event: "connection", cb: (conn: DataConnection) => void): void;
     on(event: "call", cb: (call: MediaConnection) => void): void;
-    on(event: "error", cb: (err: { type: string; message: string; }) => void): void;
-    connect(id: string, options: { metadata: { userId: string; }; }): DataConnection;
-    call(id: string, stream: MediaStream): MediaConnection;
+    on(event: "error", cb: (err: PeerError) => void): void;
+    connect(id: string, options: { metadata: { userId: string; }; }): DataConnection | undefined;
+    call(id: string, stream: MediaStream): MediaConnection | undefined;
+    reconnect(): void;
     destroy(): void;
 }
 
@@ -104,7 +111,7 @@ let watcherChannelId: string | null = null;
 let watcherToken = 0;
 let probeTimer: ReturnType<typeof setInterval> | undefined;
 let warned = false;
-const pending = new Set<string>();
+const dialing = new Map<string, DataConnection>();
 const live = new Map<string, Live>();
 
 let watching: Watching | null = null;
@@ -249,6 +256,7 @@ export function stopStream() {
     myPreview = undefined;
     links.clear();
     viewers.clear();
+    dialing.clear();
     notify();
 }
 
@@ -286,34 +294,55 @@ function targetKbps() {
     return fps >= 60 ? base * 1.5 : base;
 }
 
-function withStartBitrate(sdp: string, kbps: number) {
+function tuneAnswer(sdp: string, kbps: number) {
     const lines = sdp.split("\r\n");
-    const video = new Set(lines.flatMap(l => /^a=rtpmap:(\d+) (?:VP8|VP9|H264|AV1)\/90000/.exec(l)?.[1] ?? []));
+    const extra = new Map<string, string>();
+    for (const l of lines) {
+        const [, pt, codec] = /^a=rtpmap:(\d+) ([\w-]+)\//.exec(l) ?? [];
+        if (/^(VP8|VP9|H264|AV1)$/.test(codec)) extra.set(pt, `x-google-start-bitrate=${kbps}`);
+        if (codec === "opus") extra.set(pt, "stereo=1;maxaveragebitrate=128000");
+    }
     const hasFmtp = new Set(lines.flatMap(l => /^a=fmtp:(\d+) /.exec(l)?.[1] ?? []));
-    const param = `x-google-start-bitrate=${kbps}`;
     return lines.flatMap(line => {
         const fmtp = /^a=fmtp:(\d+) /.exec(line)?.[1];
-        if (fmtp && video.has(fmtp)) return [`${line};${param}`];
+        if (fmtp && extra.has(fmtp)) return [`${line};${extra.get(fmtp)}`];
         const rtpmap = /^a=rtpmap:(\d+) /.exec(line)?.[1];
-        if (rtpmap && video.has(rtpmap) && !hasFmtp.has(rtpmap)) return [line, `a=fmtp:${rtpmap} ${param}`];
+        if (rtpmap && extra.has(rtpmap) && !hasFmtp.has(rtpmap)) return [line, `a=fmtp:${rtpmap} ${extra.get(rtpmap)}`];
         return [line];
     }).join("\r\n");
 }
 
-function tuneSender(pc: RTCPeerConnection, kbps: number) {
-    for (const sender of pc.getSenders()) {
-        if (sender.track?.kind !== "video") continue;
-        const params: RTCRtpSendParameters & { degradationPreference?: string; } = sender.getParameters();
-        params.degradationPreference = "maintain-resolution";
-        params.encodings.forEach(e => { e.maxBitrate = kbps * 1000; });
-        sender.setParameters(params).catch(e => logger.warn("Could not tune the video sender", e));
+const HW_CODECS = ["video/AV1", "video/VP9", "video/H264;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"];
+
+async function hardwareCodec(track: MediaStreamTrack, kbps: number) {
+    const { width = 1920, height = 1080, frameRate = 30 } = track.getSettings();
+    for (const contentType of HW_CODECS) {
+        const info = await navigator.mediaCapabilities.encodingInfo({ type: "webrtc", video: { contentType, width, height, framerate: frameRate, bitrate: kbps * 1000 } }).catch(() => null);
+        if (info?.supported && info.powerEfficient) return contentType.split(";")[0];
     }
+}
+
+async function tuneSender(pc: RTCPeerConnection, kbps: number) {
+    const sender = pc.getSenders().find(s => s.track?.kind === "video");
+    if (!sender?.track) return;
+    const mime = await hardwareCodec(sender.track, kbps);
+    const { preset } = ApplicationStreamingSettingsStore.getState();
+    const params = sender.getParameters();
+    const codec = params.codecs.find(c => c.mimeType === mime);
+    params.degradationPreference = preset === ApplicationStreamPresets.PRESET_DOCUMENTS ? "maintain-resolution" : preset === ApplicationStreamPresets.PRESET_VIDEO ? "maintain-framerate" : "balanced";
+    params.encodings.forEach((e: RTCRtpEncodingParameters & { codec?: RTCRtpCodecParameters; }) => {
+        e.maxBitrate = kbps * 1000;
+        if (codec) e.codec = codec;
+    });
+    await sender.setParameters(params);
+    logger.info(codec ? `Requested ${codec.mimeType} (GPU encoder available)` : "No GPU encoder found, using the default codec");
 }
 
 function addViewer(conn: DataConnection, userId: string) {
     if (!peer || !stream) return;
     const old = viewers.get(userId);
     const call = peer.call(conn.peer, stream);
+    if (!call) return;
     viewers.set(userId, call);
     old?.close();
 
@@ -321,8 +350,8 @@ function addViewer(conn: DataConnection, userId: string) {
     const pc = call.peerConnection;
     const setRemote = pc.setRemoteDescription.bind(pc);
     pc.setRemoteDescription = async (desc: RTCSessionDescriptionInit) => {
-        await setRemote({ type: desc.type, sdp: desc.sdp && withStartBitrate(desc.sdp, Math.min(kbps, 5000)) });
-        tuneSender(pc, kbps);
+        await setRemote({ type: desc.type, sdp: desc.sdp && tuneAnswer(desc.sdp, Math.min(kbps, 5000)) });
+        tuneSender(pc, kbps).catch(e => logger.warn("Could not tune the video sender", e));
     };
     call.on("close", () => { if (viewers.get(userId) === call) dropViewer(userId); });
     sendState();
@@ -363,7 +392,7 @@ function loopbackTrack(sourceId: string) {
 }
 
 async function capture(id: string, name?: string) {
-    const { resolution, fps, soundshareEnabled } = ApplicationStreamingSettingsStore.getState();
+    const { resolution, fps, soundshareEnabled, preset } = ApplicationStreamingSettingsStore.getState();
     const size: DesktopConstraints["mandatory"] = resolution ? { maxHeight: resolution, maxWidth: Math.round(resolution * 16 / 9) } : {};
     const get = (sid: string) => navigator.mediaDevices.getUserMedia({ video: desktop({ chromeMediaSourceId: sid, maxFrameRate: fps, ...size }) });
 
@@ -377,7 +406,7 @@ async function capture(id: string, name?: string) {
             return get(fallback.id);
         });
         const [video] = s.getVideoTracks();
-        video.contentHint = "motion";
+        video.contentHint = preset === ApplicationStreamPresets.PRESET_DOCUMENTS ? "detail" : "motion";
         video.onended = stopStream;
         if (soundshareEnabled) s.addTrack(loopbackTrack(used));
         return { stream: s, id: used };
@@ -447,9 +476,43 @@ function attachLink(conn: DataConnection, userId: string) {
     });
 }
 
+function keepSignaling(p: Peer, fatal: (err: PeerError) => void) {
+    let opened = false;
+    let delay = 1000;
+    p.on("open", () => { opened = true; delay = 1000; });
+    p.on("disconnected", () => {
+        setTimeout(() => { if (p.disconnected && !p.destroyed) p.reconnect(); }, delay);
+        delay = Math.min(delay * 2, 30_000);
+    });
+    p.on("error", err => {
+        if (err.type === "peer-unavailable") {
+            const id = err.message.split(" ").pop() ?? "";
+            dialing.get(id)?.close();
+            dialing.delete(id);
+        } else if (opened) logger.warn("Signaling error", err);
+        else fatal(err);
+    });
+}
+
+function dial(p: Peer, id: string) {
+    if (!p.open || dialing.has(id)) return;
+    const conn = p.connect(id, { metadata: { userId: me() } });
+    if (!conn) return;
+    dialing.set(id, conn);
+    const settle = () => { if (dialing.get(id) === conn) dialing.delete(id); };
+    conn.on("open", settle);
+    setTimeout(() => {
+        if (!conn.open) conn.close();
+        settle();
+    }, 15_000);
+    return conn;
+}
+
 function announce(p: Peer, channelId: string) {
     for (const userId of Object.keys(VoiceStateStore.getVoiceStatesForChannel(channelId))) {
-        if (userId !== me()) attachLink(p.connect(watchId(channelId, userId), { metadata: { userId: me() } }), userId);
+        if (userId === me() || links.has(userId)) continue;
+        const conn = dial(p, watchId(channelId, userId));
+        if (conn) attachLink(conn, userId);
     }
 }
 
@@ -466,17 +529,16 @@ async function share(channelId: string, id: string, name?: string) {
     if (!Peer || !c) return stopStream();
 
     const p = new Peer(peerId(channelId, me()));
+    keepSignaling(p, err => {
+        if (peer !== p) return;
+        toast(err.type === "unavailable-id" ? "Você já está transmitindo em outra janela." : "Não consegui falar com o servidor de conexão.");
+        stopStream();
+    });
     p.on("open", () => announce(p, channelId));
     p.on("connection", conn => {
         const userId = conn.metadata?.userId;
         if (typeof userId !== "string" || !VoiceStateStore.getVoiceStateForChannel(channelId, userId)) return conn.close();
         attachLink(conn, userId);
-    });
-    p.on("error", err => {
-        if (err.type === "peer-unavailable") return;
-        if (err.type !== "unavailable-id") return toast("Não consegui falar com o servidor de conexão.");
-        toast("Você já está transmitindo em outra janela.");
-        stopStream();
     });
 
     peer = p;
@@ -541,7 +603,6 @@ export function interceptStreamActions(action: StreamAction) {
 
 function attachLive(conn: DataConnection, userId: string, channelId: string) {
     conn.on("open", () => {
-        pending.delete(userId);
         const old = live.get(userId);
         if (prefersExisting(old?.conn, conn)) return conn.close();
         live.set(userId, { conn, viewers: old?.viewers ?? [], preview: old?.preview });
@@ -557,7 +618,6 @@ function attachLive(conn: DataConnection, userId: string, channelId: string) {
         notify();
     });
     conn.on("close", () => {
-        pending.delete(userId);
         if (live.get(userId)?.conn !== conn) return;
         live.delete(userId);
         endWatching(userId);
@@ -572,16 +632,9 @@ function probe() {
     const channelId = watcherChannelId;
 
     for (const userId of Object.keys(VoiceStateStore.getVoiceStatesForChannel(channelId))) {
-        if (userId === me() || live.has(userId) || pending.has(userId)) continue;
-
-        pending.add(userId);
-        const conn = w.connect(peerId(channelId, userId), { metadata: { userId: me() } });
-        setTimeout(() => {
-            if (conn.open) return;
-            conn.close();
-            pending.delete(userId);
-        }, 15_000);
-        attachLive(conn, userId, channelId);
+        if (userId === me() || live.has(userId)) continue;
+        const conn = dial(w, peerId(channelId, userId));
+        if (conn) attachLive(conn, userId, channelId);
     }
 }
 
@@ -594,28 +647,26 @@ export function stopWatcher() {
     watcher = null;
     watcherChannelId = null;
     live.clear();
-    pending.clear();
+    dialing.clear();
     warned = false;
     notify();
 }
 
 function createWatcher(Peer: PeerCtor, channelId: string, token: number, named: boolean) {
     const w = new Peer(named ? watchId(channelId, me()) : undefined);
+    keepSignaling(w, err => {
+        w.destroy();
+        if (token !== watcherToken) return;
+        if (err.type === "unavailable-id" && named) return createWatcher(Peer, channelId, token, false);
+        if (!warned) toast("Não consegui falar com o servidor de conexão.");
+        warned = true;
+        setTimeout(() => { if (token === watcherToken) createWatcher(Peer, channelId, token, named); }, 10_000);
+    });
     w.on("open", probe);
     w.on("connection", conn => {
         const [prefix, chan, userId] = conn.peer.split("-");
         if (prefix !== "eqshare" || chan !== channelId || !VoiceStateStore.getVoiceStateForChannel(channelId, userId)) return conn.close();
         attachLive(conn, userId, channelId);
-    });
-    w.on("error", err => {
-        if (err.type === "peer-unavailable") return pending.delete(err.message.split("-").pop() ?? "");
-        if (err.type === "unavailable-id" && named && token === watcherToken) {
-            w.destroy();
-            return createWatcher(Peer, channelId, token, false);
-        }
-        if (warned) return;
-        warned = true;
-        toast("Não consegui falar com o servidor de conexão.");
     });
     w.on("call", call => {
         const userId = call.peer.split("-")[2];
@@ -641,7 +692,7 @@ async function startWatcher(channelId: string) {
 
     createWatcher(Peer, channelId, token, true);
     watcherChannelId = channelId;
-    probeTimer = setInterval(probe, 5000);
+    probeTimer = setInterval(probe, 30_000);
 }
 
 export function onVoiceChannel(channelId: string | null) {
