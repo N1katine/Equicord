@@ -219,7 +219,7 @@ async function loadPeer(): Promise<PeerCtor | undefined> {
         // @ts-expect-error
         return (await import("https://cdn.jsdelivr.net/npm/peerjs@1.5.5/+esm")).Peer;
     } catch {
-        toast("Não consegui carregar a biblioteca de conexão.");
+        toast("Couldn't load the connection library.");
     }
 }
 
@@ -384,7 +384,7 @@ function loopbackTrack(sourceId: string) {
             await writer.write(new AudioData({ format: "s16", sampleRate: 48000, numberOfChannels: 2, numberOfFrames: n, timestamp: frames * 1e6 / 48000, data: data.subarray(0, n * 4) }));
             frames += n;
         }
-        if (!frames && generator.readyState === "live") toast("Não consegui capturar o áudio do PC, transmitindo só a imagem.");
+        if (!frames && generator.readyState === "live") toast("Couldn't capture your PC audio, streaming video only.");
         generator.stop();
     })().catch(e => logger.error("Audio capture failed", e));
 
@@ -531,7 +531,7 @@ async function share(channelId: string, id: string, name?: string) {
     const p = new Peer(peerId(channelId, me()));
     keepSignaling(p, err => {
         if (peer !== p) return;
-        toast(err.type === "unavailable-id" ? "Você já está transmitindo em outra janela." : "Não consegui falar com o servidor de conexão.");
+        toast(err.type === "unavailable-id" ? "You're already streaming in another window." : "Couldn't reach the connection server.");
         stopStream();
     });
     p.on("open", () => announce(p, channelId));
@@ -569,7 +569,7 @@ export function interceptStreamActions(action: StreamAction) {
         case "STREAM_START": {
             if (!p2pRoute() || !action.channelId) return false;
             if (!action.sourceId) {
-                toast("Escolha uma tela ou janela para transmitir.");
+                toast("Pick a screen or window to stream.");
                 return true;
             }
             if (streamChannelId) scheduleRecapture(undefined, { id: action.sourceId, name: action.sourceName });
@@ -658,7 +658,7 @@ function createWatcher(Peer: PeerCtor, channelId: string, token: number, named: 
         w.destroy();
         if (token !== watcherToken) return;
         if (err.type === "unavailable-id" && named) return createWatcher(Peer, channelId, token, false);
-        if (!warned) toast("Não consegui falar com o servidor de conexão.");
+        if (!warned) toast("Couldn't reach the connection server.");
         warned = true;
         setTimeout(() => { if (token === watcherToken) createWatcher(Peer, channelId, token, named); }, 10_000);
     });

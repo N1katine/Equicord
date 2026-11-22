@@ -16,12 +16,12 @@ import { renderTile, startWatching } from "./ui";
 
 const userContext: NavContextMenuPatchCallback = (children, { user }: { user?: User; }) => {
     if (!user || !isLive(user.id)) return;
-    children.push(<Menu.MenuItem id="vc-p2p-watch" label="Assistir transmissão" icon={ScreenshareIcon} action={() => startWatching(user.id)} />);
+    children.push(<Menu.MenuItem id="vc-p2p-watch" label="Watch Stream" icon={ScreenshareIcon} action={() => startWatching(user.id)} />);
 };
 
 export default definePlugin({
     name: "P2PScreenShare",
-    description: "Transmite sua tela direto para quem está na mesma call, sem passar pelo Go Live do Discord.",
+    description: "Streams your screen directly to people in the same call, without going through Discord's Go Live.",
     tags: ["Media", "Voice"],
     authors: [EquicordDevs.N1katine],
 
