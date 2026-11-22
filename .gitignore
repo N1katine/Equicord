@@ -41,3 +41,7 @@ misc/bundle
 
 # intl scripts
 misc/scripts
+
+# superpowers
+docs/superpowers/
+.superpowers/
