@@ -35,7 +35,7 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   sed 's/$/\r/' install.bat > dist/install.bat
-                  gh release view latest > /dev/null 2>&1 || gh release create latest --title "P2PScreenShare" --notes "Baixe o install.bat abaixo e execute. As atualizações chegam pelo próprio Equicord."
+                  gh release view latest > /dev/null 2>&1 || gh release create latest --title "P2PScreenShare" --notes ""
                   gh release upload latest --clobber dist/desktop.asar dist/install.bat
                   # The updater takes the published commit from the title's last word, so it changes only after the upload.
-                  gh release edit latest --title "P2PScreenShare $GITHUB_SHA"
+                  gh release edit latest --title "P2PScreenShare $GITHUB_SHA" --notes "Download install.bat below and run it. Future updates arrive through Equicord itself."
