@@ -175,10 +175,16 @@ export default definePlugin({
         },
         {
             find: '"stream-settings-fps"',
-            replacement: {
-                match: /(\i\.\i)\.getGoLiveSource\(\)/g,
-                replace: "($self.getGoLiveSource()??$1.getGoLiveSource())"
-            }
+            replacement: [
+                {
+                    match: /(\i\.\i)\.getGoLiveSource\(\)/g,
+                    replace: "($self.getGoLiveSource()??$1.getGoLiveSource())"
+                },
+                {
+                    match: /(let \i=)(\i\.isPlatformEmbedded\?\(0,\i\.jsx\)\(\i\.\i,\{id:"stream-settings",)/,
+                    replace: "$1!$self.isP2PStream(arguments[0].stream)&&$2"
+                }
+            ]
         },
         {
             find: 'navId:"manage-streams"',
@@ -192,6 +198,13 @@ export default definePlugin({
             replacement: {
                 match: /(function \i\(\i,\i,\i,\i,\i,\i\)\{)(?=if\(\i===\i\.\i\.PRESET_AUTO\))/,
                 replace: "$1if($self.p2pRoute())return!0;"
+            }
+        },
+        {
+            find: 'name:"2026-05-frontier-tuning"',
+            replacement: {
+                match: /(function \i\(\i,\i,\i\)\{)(?=if\(null==\i\|\|)/,
+                replace: "$1if($self.p2pRoute())return null;"
             }
         }
     ],

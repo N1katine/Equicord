@@ -77,18 +77,12 @@ export interface Stream {
     ownerId: string;
 }
 
-interface GoLiveSettings {
-    qualityOptions?: { preset: number; resolution: number; frameRate: number; };
-    desktopSettings?: { sourceId: string; sound: boolean; };
-}
-
 interface StreamAction {
     type: string;
     streamKey?: string;
     channelId?: string;
     sourceId?: string;
     sourceName?: string;
-    settings?: GoLiveSettings | null;
 }
 
 const Native = VencordNative.pluginHelpers.P2PScreenShare as PluginNative<typeof import("./native")>;
@@ -118,10 +112,8 @@ let watching: Watching | null = null;
 let watchCall: MediaConnection | null = null;
 
 let recaptureTimer: ReturnType<typeof setTimeout> | undefined;
-let pendingGoLive: GoLiveSettings | undefined;
 let pendingSource: { id: string; name?: string; } | undefined;
 let recaptureQueue: Promise<void> = Promise.resolve();
-let applyingSettings = false;
 
 const listeners = new Set<() => void>();
 const notify = () => listeners.forEach(l => l());
@@ -431,23 +423,14 @@ async function recapture(id = sourceId, name?: string) {
     notify();
 }
 
-function scheduleRecapture(settings?: GoLiveSettings, source?: { id: string; name?: string; }) {
-    if (settings) pendingGoLive = settings;
+function scheduleRecapture(source?: { id: string; name?: string; }) {
     if (source) pendingSource = source;
     clearTimeout(recaptureTimer);
     recaptureTimer = setTimeout(() => {
-        const g = pendingGoLive;
         const src = pendingSource;
-        pendingGoLive = undefined;
         pendingSource = undefined;
-        const q = g?.qualityOptions;
-        if (q) {
-            applyingSettings = true;
-            FluxDispatcher.dispatch({ type: "STREAM_UPDATE_SETTINGS", preset: q.preset, resolution: q.resolution, frameRate: q.frameRate, soundshareEnabled: g.desktopSettings?.sound });
-            applyingSettings = false;
-        }
         recaptureQueue = recaptureQueue
-            .then(() => recapture(src?.id ?? g?.desktopSettings?.sourceId, src?.name))
+            .then(() => recapture(src?.id, src?.name))
             .catch(e => logger.error("Recapture failed", e));
     });
 }
@@ -572,7 +555,7 @@ export function interceptStreamActions(action: StreamAction) {
                 toast("Pick a screen or window to stream.");
                 return true;
             }
-            if (streamChannelId) scheduleRecapture(undefined, { id: action.sourceId, name: action.sourceName });
+            if (streamChannelId) scheduleRecapture({ id: action.sourceId, name: action.sourceName });
             else share(action.channelId, action.sourceId, action.sourceName);
             return true;
         }
@@ -591,11 +574,9 @@ export function interceptStreamActions(action: StreamAction) {
             return true;
         }
         case "MEDIA_ENGINE_SET_GO_LIVE_SOURCE":
-            if (!streamChannelId) return false;
-            if (action.settings) scheduleRecapture(action.settings);
-            return true;
+            return !!streamChannelId;
         case "STREAM_UPDATE_SETTINGS":
-            if (stream && !applyingSettings) scheduleRecapture();
+            if (stream) scheduleRecapture();
             return false;
     }
     return false;
