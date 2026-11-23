@@ -23,6 +23,7 @@ interface DataConnection {
     close(): void;
     on(event: "open" | "close", cb: () => void): void;
     on(event: "data", cb: (data: unknown) => void): void;
+    on(event: "iceStateChanged", cb: (state: RTCIceConnectionState) => void): void;
 }
 
 interface MediaConnection {
@@ -457,7 +458,16 @@ function scheduleRecapture(source?: { id: string; name?: string; }) {
 const prefersExisting = (old: DataConnection | undefined, conn: DataConnection) =>
     old != null && old !== conn && old.open && old.connectionId > conn.connectionId;
 
+function closeWhenDead(conn: DataConnection) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    conn.on("iceStateChanged", state => {
+        clearTimeout(timer);
+        if (state === "disconnected") timer = setTimeout(() => conn.close(), 10_000);
+    });
+}
+
 function attachLink(conn: DataConnection, userId: string) {
+    closeWhenDead(conn);
     conn.on("open", () => {
         const old = links.get(userId);
         if (prefersExisting(old, conn)) return conn.close();
@@ -602,6 +612,7 @@ export function interceptStreamActions(action: StreamAction) {
 }
 
 function attachLive(conn: DataConnection, userId: string, channelId: string, preexisting: boolean) {
+    closeWhenDead(conn);
     conn.on("open", () => {
         const old = live.get(userId);
         if (prefersExisting(old?.conn, conn)) return conn.close();
