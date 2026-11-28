@@ -5,7 +5,7 @@
  */
 
 import { findComponentByCodeLazy } from "@webpack";
-import { ChannelRouter, FluxDispatcher, MediaEngineStore, useEffect, useRef, UserStore, useStateFromStores } from "@webpack/common";
+import { ChannelRouter, FluxDispatcher, MediaEngineStore, SelectedChannelStore, useEffect, useRef, UserStore, useStateFromStores } from "@webpack/common";
 import type { ComponentType } from "react";
 
 import { getWatching, isP2PStream, type Stream, streamKeyFor, useTileStream, watch } from "./net";
@@ -21,9 +21,7 @@ const Spinner = findComponentByCodeLazy('"pulsingEllipsis"');
 
 export function startWatching(userId: string) {
     if (!watch(userId)) return false;
-    const w = getWatching();
-    if (!w) return false;
-    const { channelId } = w;
+    const channelId = SelectedChannelStore.getVoiceChannelId()!;
     ChannelRouter.transitionToChannel(channelId);
     setTimeout(() => FluxDispatcher.dispatch({ type: "CHANNEL_RTC_SELECT_PARTICIPANT", channelId, id: streamKeyFor(userId, channelId) }));
     return true;
@@ -50,10 +48,10 @@ function TileVideo({ userId }: { userId: string; }) {
 export function renderTile({ participant, selected, width }: TileProps, Ended: ComponentType<{ selected: boolean; stream: Stream; width: number; }>) {
     if (participant.type !== STREAM_PARTICIPANT || !isP2PStream(participant.stream)) return null;
     const { ownerId } = participant.stream;
-    const w = getWatching();
+    const w = getWatching(ownerId);
 
-    if (w?.userId === ownerId && w.ended) return <Ended selected={selected} stream={participant.stream} width={width} />;
+    if (w?.ended) return <Ended selected={selected} stream={participant.stream} width={width} />;
     if (selected) return null;
-    if (ownerId === UserStore.getCurrentUser().id || w?.userId === ownerId) return <TileVideo userId={ownerId} />;
+    if (ownerId === UserStore.getCurrentUser().id || w) return <TileVideo userId={ownerId} />;
     return null;
 }

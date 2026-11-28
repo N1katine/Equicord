@@ -11,7 +11,7 @@ import definePlugin from "@utils/types";
 import type { User } from "@vencord/discord-types";
 import { FluxDispatcher, Menu, SelectedChannelStore } from "@webpack/common";
 
-import { activeP2PStreams, getActiveP2PStream, getGoLiveSource, getP2PStream, interceptStreamActions, isActiveP2PKey, isLive, isP2PStream, isPreexistingLive, liveOwnersIn, myStream, onVoiceChannel, p2pRoute, P2PStore, p2pViewerIds, stopStream, stopWatcher, unwatch, useP2P, usePreview, useStreaming, useWatchingIn } from "./net";
+import { activeP2PStreams, getActiveP2PStream, getGoLiveSource, getP2PStream, interceptStreamActions, isActiveP2PKey, isLive, isP2PStream, isPreexistingLive, liveOwnersIn, myStream, onVoiceChannel, p2pRoute, P2PStore, p2pViewerIds, stopStream, stopWatcher, unwatchSelected, useP2P, usePreview, useStreaming, useWatchingIn } from "./net";
 import { renderTile, startWatching } from "./ui";
 
 const userContext: NavContextMenuPatchCallback = (children, { user }: { user?: User; }) => {
@@ -112,7 +112,7 @@ export default definePlugin({
                 },
                 {
                     match: /(\i\.useCallback\(\(\)=>\{)(if\(null!=\i\)\(0,\i\.\i\)\(\(0,\i\.\i\)\(\i\)\);else for\(let \i of \i\))/,
-                    replace: "$1if($self.unwatch())return;$2"
+                    replace: "$1if($self.unwatchSelected())return;$2"
                 },
                 {
                     match: /canGoLive:(\i)(,hasPermission:\i,videoBlocked:\i=!1,disabled:\i\}=\i,)/,
@@ -232,7 +232,7 @@ export default definePlugin({
     usePreview,
     useStreaming,
     useWatchingIn,
-    unwatch,
+    unwatchSelected,
     stopStream,
     myStream,
     getGoLiveSource,

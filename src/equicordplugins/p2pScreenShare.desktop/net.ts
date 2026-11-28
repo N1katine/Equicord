@@ -9,7 +9,7 @@ import { Logger } from "@utils/Logger";
 import { PluginNative } from "@utils/types";
 import { ApplicationStreamPresets } from "@vencord/discord-types/enums";
 import { findLazy } from "@webpack";
-import { ApplicationStreamingSettingsStore, ChannelStore, Flux, FluxDispatcher, SelectedChannelStore, showToast, UserStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
+import { ApplicationStreamingSettingsStore, ChannelRTCStore, ChannelStore, Flux, FluxDispatcher, SelectedChannelStore, showToast, UserStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
 
 type Message = { t: "state"; viewers: string[]; } | { t: "preview"; img: string; } | { t: "watch"; } | { t: "unwatch"; } | { t: "sdp"; sdp: string; };
 
@@ -56,8 +56,7 @@ interface Live {
     stream?: MediaStream;
 }
 
-export interface Watching {
-    userId: string;
+interface Watching {
     channelId: string;
     stream: MediaStream | null;
     ended: boolean;
@@ -100,7 +99,7 @@ let warned = false;
 const dialing = new Map<string, DataConnection>();
 const live = new Map<string, Live>();
 
-let watching: Watching | null = null;
+const watching = new Map<string, Watching>();
 
 let recaptureTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingSource: { id: string; name?: string; } | undefined;
@@ -140,7 +139,7 @@ function isMessage(d: unknown): d is Message {
 
 export const p2pRoute = () => !VideoGuard.k.getConfig({ location: "P2PScreenShare" }).videoEnabled;
 export const isLive = (userId: string) => userId === me() ? streamChannelId != null : live.has(userId);
-export const getWatching = () => watching;
+export const getWatching = (userId: string) => watching.get(userId);
 export const myStream = () => streamChannelId ? streamFor(streamChannelId, me()) : null;
 export const getGoLiveSource = () => streamChannelId && sourceId ? { desktopSource: { id: sourceId } } : null;
 
@@ -149,7 +148,8 @@ export const streamKeyFor = (userId: string, channelId: string) => keyOf(streamF
 
 export function getP2PStream(userId: string, channelId: string) {
     const liveHere = userId === me() ? streamChannelId === channelId : live.has(userId) && watcherChannelId === channelId;
-    const endedHere = watching?.userId === userId && watching.ended && watching.channelId === channelId;
+    const w = watching.get(userId);
+    const endedHere = w?.ended && w.channelId === channelId;
     return liveHere || endedHere ? streamFor(channelId, userId) : null;
 }
 
@@ -157,7 +157,7 @@ export const liveOwnersIn = (channelId: string) => [
     ...(streamChannelId === channelId ? [me()] : []),
     ...(watcherChannelId === channelId ? live.keys() : [])
 ];
-export const activeP2PStreams = () => [myStream(), watching && streamFor(watching.channelId, watching.userId)].filter(s => s != null);
+export const activeP2PStreams = () => [myStream(), ...Array.from(watching, ([userId, w]) => streamFor(w.channelId, userId))].filter(s => s != null);
 export const isPreexistingLive = (userId: string) => !!live.get(userId)?.preexisting;
 
 export function p2pViewerIds(key: string) {
@@ -169,11 +169,11 @@ export function p2pViewerIds(key: string) {
 export function getActiveP2PStream(participant: { stream: Stream; }) {
     if (!isP2PStream(participant.stream)) return null;
     const { ownerId } = participant.stream;
-    return { state: watching?.userId === ownerId && watching.ended ? "ENDED" : "ACTIVE" };
+    return { state: watching.get(ownerId)?.ended ? "ENDED" : "ACTIVE" };
 }
 
 function isWatcher(userId: string) {
-    if (userId === me()) return watching != null;
+    if (userId === me()) return watching.size > 0;
     return viewers.has(userId) || [...live.values()].some(l => l.viewers.includes(userId));
 }
 
@@ -187,9 +187,9 @@ export function usePreview<T>(s: Stream, native: T) {
     return preview === undefined ? native : { previewUrl: preview, isLoading: false };
 }
 
-export const useTileStream = (userId: string) => useStateFromStores([P2PStore], () => userId === me() ? stream : watching?.stream ?? null);
+export const useTileStream = (userId: string) => useStateFromStores([P2PStore], () => userId === me() ? stream : watching.get(userId)?.stream ?? null);
 export const useStreaming = () => useStateFromStores([P2PStore], () => streamChannelId != null);
-export const useWatchingIn = (channelId: string) => useStateFromStores([P2PStore], () => watching?.channelId === channelId);
+export const useWatchingIn = (channelId: string) => useStateFromStores([P2PStore, ChannelRTCStore], () => selectedWatched(channelId) != null);
 
 async function loadPeer(): Promise<PeerCtor | undefined> {
     try {
@@ -210,14 +210,14 @@ function sendState() {
 }
 
 function endWatching(userId: string) {
-    if (watching?.userId !== userId) return;
-    watching.ended = true;
-    refresh(userId, watching.channelId);
+    const w = watching.get(userId);
+    if (!w) return;
+    w.ended = true;
+    refresh(userId, w.channelId);
     notify();
 }
 
 export function stopStream() {
-    if (watching?.userId === me()) unwatch();
     refresh(me(), streamChannelId);
     streamToken++;
     clearInterval(previewTimer);
@@ -571,7 +571,12 @@ const parseKey = (key = "") => {
 export function isActiveP2PKey(key: string) {
     const { channelId, ownerId } = parseKey(key);
     if (ownerId === me()) return streamChannelId === channelId;
-    return watching != null && watching.userId === ownerId && watching.channelId === channelId;
+    return watching.get(ownerId)?.channelId === channelId;
+}
+
+function selectedWatched(channelId: string) {
+    const { ownerId } = parseKey(ChannelRTCStore.getSelectedParticipantId(channelId) ?? "");
+    return watching.get(ownerId)?.channelId === channelId ? ownerId : null;
 }
 
 function ownedP2PKey(key: string | undefined) {
@@ -601,7 +606,7 @@ export function interceptStreamActions(action: StreamAction) {
         case "STREAM_CLOSE": {
             const ownerId = ownedP2PKey(action.streamKey);
             if (!ownerId) return false;
-            if (ownerId !== me()) unwatch();
+            if (ownerId !== me()) unwatch(ownerId);
             else if (action.type === "STREAM_STOP") stopStream();
             return true;
         }
@@ -620,9 +625,10 @@ function attachLive(conn: DataConnection, userId: string, channelId: string, pre
         const l = live.get(userId);
         if (l?.conn !== conn) return;
         l.stream = s;
-        if (watching?.userId === userId) {
-            watching.stream = s;
-            watching.ended = false;
+        const w = watching.get(userId);
+        if (w) {
+            w.stream = s;
+            w.ended = false;
         }
         notify();
     });
@@ -668,7 +674,7 @@ function probe(only?: string) {
 export function stopWatcher() {
     watcherToken++;
     clearInterval(probeTimer);
-    unwatch();
+    watching.forEach((_, userId) => unwatch(userId));
     live.forEach((_, userId) => refresh(userId, watcherChannelId));
     watcher?.destroy();
     watcher = null;
@@ -720,23 +726,30 @@ export function onVoiceChannel(channelId: string | null) {
 export function watch(userId: string) {
     const channelId = SelectedChannelStore.getVoiceChannelId();
     if (!channelId || !isLive(userId)) return false;
-    if (watching?.userId === userId && watching.channelId === channelId && !watching.ended) return true;
+    if (userId === me()) return true;
+    const w = watching.get(userId);
+    if (w?.channelId === channelId && !w.ended) return true;
 
-    unwatch();
     const l = live.get(userId);
-    watching = { userId, channelId, stream: userId === me() ? stream : l?.stream ?? null, ended: false };
+    watching.set(userId, { channelId, stream: l?.stream ?? null, ended: false });
     if (l?.conn.open) l.conn.send({ t: "watch" });
     refresh(userId, channelId);
     notify();
     return true;
 }
 
-export function unwatch() {
-    if (!watching) return false;
-    const l = live.get(watching.userId);
+export function unwatch(userId: string) {
+    const w = watching.get(userId);
+    if (!w) return false;
+    const l = live.get(userId);
     if (l?.conn.open) l.conn.send({ t: "unwatch" });
-    refresh(watching.userId, watching.channelId);
-    watching = null;
+    refresh(userId, w.channelId);
+    watching.delete(userId);
     notify();
     return true;
+}
+
+export function unwatchSelected() {
+    const ownerId = watcherChannelId && selectedWatched(watcherChannelId);
+    return !!ownerId && unwatch(ownerId);
 }
