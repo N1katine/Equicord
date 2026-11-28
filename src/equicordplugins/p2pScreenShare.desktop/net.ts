@@ -720,6 +720,7 @@ export function onVoiceChannel(channelId: string | null) {
 export function watch(userId: string) {
     const channelId = SelectedChannelStore.getVoiceChannelId();
     if (!channelId || !isLive(userId)) return false;
+    if (watching?.userId === userId && watching.channelId === channelId && !watching.ended) return true;
 
     unwatch();
     const l = live.get(userId);
