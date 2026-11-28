@@ -6,33 +6,24 @@
 
 import { proxyLazy } from "@utils/lazy";
 import { Logger } from "@utils/Logger";
-import { useForceUpdater } from "@utils/react";
 import { PluginNative } from "@utils/types";
 import { ApplicationStreamPresets } from "@vencord/discord-types/enums";
 import { findLazy } from "@webpack";
-import { ApplicationStreamingSettingsStore, ChannelStore, Flux, FluxDispatcher, SelectedChannelStore, showToast, useEffect, UserStore, VoiceStateStore } from "@webpack/common";
+import { ApplicationStreamingSettingsStore, ChannelStore, Flux, FluxDispatcher, SelectedChannelStore, showToast, UserStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
 
-type Message = { t: "state"; viewers: string[]; } | { t: "preview"; img: string; } | { t: "watch"; } | { t: "unwatch"; };
+type Message = { t: "state"; viewers: string[]; } | { t: "preview"; img: string; } | { t: "watch"; } | { t: "unwatch"; } | { t: "sdp"; sdp: string; };
 
 interface DataConnection {
     peer: string;
     connectionId: string;
     open: boolean;
+    peerConnection: RTCPeerConnection;
     metadata?: { userId?: unknown; };
     send(data: Message): void;
     close(): void;
     on(event: "open" | "close", cb: () => void): void;
     on(event: "data", cb: (data: unknown) => void): void;
     on(event: "iceStateChanged", cb: (state: RTCIceConnectionState) => void): void;
-}
-
-interface MediaConnection {
-    peer: string;
-    peerConnection: RTCPeerConnection;
-    answer(): void;
-    close(): void;
-    on(event: "stream", cb: (stream: MediaStream) => void): void;
-    on(event: "close", cb: () => void): void;
 }
 
 type PeerError = { type: string; message: string; };
@@ -43,10 +34,8 @@ interface Peer {
     destroyed: boolean;
     on(event: "open" | "disconnected", cb: () => void): void;
     on(event: "connection", cb: (conn: DataConnection) => void): void;
-    on(event: "call", cb: (call: MediaConnection) => void): void;
     on(event: "error", cb: (err: PeerError) => void): void;
     connect(id: string, options: { metadata: { userId: string; }; }): DataConnection | undefined;
-    call(id: string, stream: MediaStream): MediaConnection | undefined;
     reconnect(): void;
     destroy(): void;
 }
@@ -64,6 +53,7 @@ interface Live {
     viewers: string[];
     preview?: string;
     preexisting: boolean;
+    stream?: MediaStream;
 }
 
 export interface Watching {
@@ -97,11 +87,10 @@ let stream: MediaStream | null = null;
 let streamChannelId: string | null = null;
 let streamToken = 0;
 let sourceId: string | null = null;
-let previewVideo: HTMLVideoElement | null = null;
 let previewTimer: ReturnType<typeof setInterval> | undefined;
 let myPreview: string | undefined;
 const links = new Map<string, DataConnection>();
-const viewers = new Map<string, MediaConnection>();
+const viewers = new Set<string>();
 
 let watcher: Peer | null = null;
 let watcherChannelId: string | null = null;
@@ -112,30 +101,17 @@ const dialing = new Map<string, DataConnection>();
 const live = new Map<string, Live>();
 
 let watching: Watching | null = null;
-let watchCall: MediaConnection | null = null;
 
 let recaptureTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingSource: { id: string; name?: string; } | undefined;
 let recaptureQueue: Promise<void> = Promise.resolve();
 
-const listeners = new Set<() => void>();
 export const P2PStore = proxyLazy(() => new (class P2PScreenShareStore extends Flux.Store { })(FluxDispatcher));
-const notify = () => {
-    listeners.forEach(l => l());
-    P2PStore.emitChange();
-};
-
-function useNotify() {
-    const rerender = useForceUpdater();
-    useEffect(() => {
-        listeners.add(rerender);
-        return () => { listeners.delete(rerender); };
-    }, []);
-}
+const notify = () => P2PStore.emitChange();
 
 const me = () => UserStore.getCurrentUser().id;
-const peerId = (channelId: string, userId: string) => `eqshare-${channelId}-${userId}`;
-const watchId = (channelId: string, userId: string) => `eqwatch-${channelId}-${userId}`;
+const peerId = (channelId: string, userId: string) => `eqshare2-${channelId}-${userId}`;
+const watchId = (channelId: string, userId: string) => `eqwatch2-${channelId}-${userId}`;
 const toast = (text: string) => showToast({ text, variant: "critical" });
 const desktop = (extra?: DesktopConstraints["mandatory"]): DesktopConstraints => ({ mandatory: { chromeMediaSource: "desktop", ...extra } });
 
@@ -158,6 +134,7 @@ function isMessage(d: unknown): d is Message {
     if (typeof d !== "object" || d === null || !("t" in d)) return false;
     if (d.t === "watch" || d.t === "unwatch") return true;
     if (d.t === "state") return "viewers" in d && Array.isArray(d.viewers) && d.viewers.every(v => typeof v === "string");
+    if (d.t === "sdp") return "sdp" in d && typeof d.sdp === "string";
     return d.t === "preview" && "img" in d && typeof d.img === "string" && d.img.startsWith("data:image/jpeg;base64,");
 }
 
@@ -200,31 +177,19 @@ function isWatcher(userId: string) {
     return viewers.has(userId) || [...live.values()].some(l => l.viewers.includes(userId));
 }
 
-export function useP2P(userId: string) {
-    useNotify();
-    return { live: isLive(userId), watching: isWatcher(userId) };
-}
+export const useP2P = (userId: string) => ({
+    live: useStateFromStores([P2PStore], () => isLive(userId)),
+    watching: useStateFromStores([P2PStore], () => isWatcher(userId))
+});
 
 export function usePreview<T>(s: Stream, native: T) {
-    useNotify();
-    if (!isP2PStream(s) || !isLive(s.ownerId)) return native;
-    return { previewUrl: (s.ownerId === me() ? myPreview : live.get(s.ownerId)?.preview) ?? null, isLoading: false };
+    const preview = useStateFromStores([P2PStore], () => isP2PStream(s) && isLive(s.ownerId) ? (s.ownerId === me() ? myPreview : live.get(s.ownerId)?.preview) ?? null : undefined);
+    return preview === undefined ? native : { previewUrl: preview, isLoading: false };
 }
 
-export function useTileStream(userId: string) {
-    useNotify();
-    return userId === me() ? stream : watching?.stream ?? null;
-}
-
-export function useStreaming() {
-    useNotify();
-    return streamChannelId != null;
-}
-
-export function useWatchingIn(channelId: string) {
-    useNotify();
-    return watching?.channelId === channelId;
-}
+export const useTileStream = (userId: string) => useStateFromStores([P2PStore], () => userId === me() ? stream : watching?.stream ?? null);
+export const useStreaming = () => useStateFromStores([P2PStore], () => streamChannelId != null);
+export const useWatchingIn = (channelId: string) => useStateFromStores([P2PStore], () => watching?.channelId === channelId);
 
 async function loadPeer(): Promise<PeerCtor | undefined> {
     try {
@@ -247,7 +212,6 @@ function sendState() {
 function endWatching(userId: string) {
     if (watching?.userId !== userId) return;
     watching.ended = true;
-    watchCall = null;
     refresh(userId, watching.channelId);
     notify();
 }
@@ -264,7 +228,6 @@ export function stopStream() {
     stream = null;
     streamChannelId = null;
     sourceId = null;
-    previewVideo = null;
     myPreview = undefined;
     links.clear();
     viewers.clear();
@@ -273,7 +236,7 @@ export function stopStream() {
 }
 
 function startPreviews(s: MediaStream) {
-    const video = previewVideo = document.createElement("video");
+    const video = document.createElement("video");
     const canvas = document.createElement("canvas");
     video.muted = true;
     video.srcObject = s;
@@ -293,10 +256,9 @@ function startPreviews(s: MediaStream) {
 }
 
 function dropViewer(userId: string) {
-    const call = viewers.get(userId);
-    if (!call) return;
-    viewers.delete(userId);
-    call.close();
+    if (!viewers.delete(userId)) return;
+    const pc = links.get(userId)?.peerConnection;
+    if (pc) setTracks(pc, []);
     sendState();
 }
 
@@ -325,6 +287,7 @@ function tuneAnswer(sdp: string, kbps: number) {
 }
 
 const HW_CODECS = ["video/AV1", "video/VP9", "video/H264;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"];
+const hwCodecs = new WeakMap<MediaStreamTrack, Promise<string | undefined>>();
 
 async function hardwareCodec(track: MediaStreamTrack, kbps: number) {
     const { width = 1920, height = 1080, frameRate = 30 } = track.getSettings();
@@ -337,7 +300,8 @@ async function hardwareCodec(track: MediaStreamTrack, kbps: number) {
 async function tuneSender(pc: RTCPeerConnection, kbps: number) {
     const sender = pc.getSenders().find(s => s.track?.kind === "video");
     if (!sender?.track) return;
-    const mime = await hardwareCodec(sender.track, kbps);
+    if (!hwCodecs.has(sender.track)) hwCodecs.set(sender.track, hardwareCodec(sender.track, kbps));
+    const mime = await hwCodecs.get(sender.track);
     const { preset } = ApplicationStreamingSettingsStore.getState();
     const params = sender.getParameters();
     const codec = params.codecs.find(c => c.mimeType === mime);
@@ -351,22 +315,40 @@ async function tuneSender(pc: RTCPeerConnection, kbps: number) {
 }
 
 function addViewer(conn: DataConnection, userId: string) {
-    if (!peer || !stream) return;
-    const old = viewers.get(userId);
-    const call = peer.call(conn.peer, stream);
-    if (!call) return;
-    viewers.set(userId, call);
-    old?.close();
-
-    const kbps = targetKbps();
-    const pc = call.peerConnection;
-    const setRemote = pc.setRemoteDescription.bind(pc);
-    pc.setRemoteDescription = async (desc: RTCSessionDescriptionInit) => {
-        await setRemote({ type: desc.type, sdp: desc.sdp && tuneAnswer(desc.sdp, Math.min(kbps, 5000)) });
-        tuneSender(pc, kbps).catch(e => logger.warn("Could not tune the video sender", e));
-    };
-    call.on("close", () => { if (viewers.get(userId) === call) dropViewer(userId); });
+    if (!stream) return;
+    viewers.add(userId);
+    setTracks(conn.peerConnection, stream.getTracks());
     sendState();
+}
+
+function setTracks(pc: RTCPeerConnection, tracks: MediaStreamTrack[]) {
+    return Promise.all(["video", "audio"].map(async kind => {
+        const track = tracks.find(t => t.kind === kind) ?? null;
+        const sender = pc.getTransceivers().find(t => t.receiver.track.kind === kind)?.sender;
+        if (sender) await sender.replaceTrack(track);
+        else if (track && stream) pc.addTransceiver(track, { direction: "sendonly", streams: [stream] });
+    })).catch(e => logger.warn("Could not switch tracks", e));
+}
+
+async function negotiate(conn: DataConnection, offer?: string) {
+    const pc = conn.peerConnection;
+    if (offer) await pc.setRemoteDescription({ type: "offer", sdp: offer });
+    await pc.setLocalDescription();
+    if (pc.localDescription) conn.send({ t: "sdp", sdp: pc.localDescription.sdp });
+}
+
+async function acceptAnswer(pc: RTCPeerConnection, sdp: string) {
+    const kbps = targetKbps();
+    await pc.setRemoteDescription({ type: "answer", sdp: tuneAnswer(sdp, Math.min(kbps, 5000)) });
+    await tuneSender(pc, kbps);
+}
+
+async function logRoute(conn: DataConnection, userId: string) {
+    const stats = [...(await conn.peerConnection.getStats()).values()];
+    const pair = stats.find(s => s.id === stats.find(t => t.type === "transport")?.selectedCandidatePairId);
+    if (!pair) return;
+    const relayed = stats.some(s => s.candidateType === "relay" && (s.id === pair.localCandidateId || s.id === pair.remoteCandidateId));
+    logger.info(`Link with ${userId} is ${relayed ? "relayed through PeerJS's TURN server, quality may suffer" : "direct"}`);
 }
 
 function pickSource(sources: { id: string; name: string; }[], id: string, name?: string) {
@@ -404,7 +386,7 @@ function loopbackTrack(sourceId: string) {
 }
 
 async function capture(id: string, name?: string) {
-    const { resolution, fps, soundshareEnabled, preset } = ApplicationStreamingSettingsStore.getState();
+    const { resolution, fps, preset } = ApplicationStreamingSettingsStore.getState();
     const size: DesktopConstraints["mandatory"] = resolution ? { maxHeight: resolution, maxWidth: Math.round(resolution * 16 / 9) } : {};
     const get = (sid: string) => navigator.mediaDevices.getUserMedia({ video: desktop({ chromeMediaSourceId: sid, maxFrameRate: fps, ...size }) });
 
@@ -420,26 +402,40 @@ async function capture(id: string, name?: string) {
         const [video] = s.getVideoTracks();
         video.contentHint = preset === ApplicationStreamPresets.PRESET_DOCUMENTS ? "detail" : "motion";
         video.onended = stopStream;
-        if (soundshareEnabled) s.addTrack(loopbackTrack(used));
-        return { stream: s, id: used };
+        return { track: video, id: used };
     } catch (e) {
         logger.error(`Could not capture ${id} (${name})`, e);
     }
 }
 
+const audioTarget = (id: string) => id.startsWith("window:") ? id : "screen";
+
 async function recapture(id = sourceId, name?: string) {
     if (!stream || !id) return;
+    const token = streamToken;
     const c = await capture(id, name);
     if (!c) return;
-    if (!stream) return c.stream.getTracks().forEach(t => t.stop());
+    if (token !== streamToken || !stream || !sourceId) return c.track.stop();
 
-    const old = stream;
-    stream = c.stream;
+    const [oldVideo] = stream.getVideoTracks();
+    const [oldAudio] = stream.getAudioTracks();
+    const { soundshareEnabled } = ApplicationStreamingSettingsStore.getState();
+    stream.removeTrack(oldVideo);
+    stream.addTrack(c.track);
+    oldVideo.stop();
+    if (oldAudio && (!soundshareEnabled || audioTarget(c.id) !== audioTarget(sourceId))) {
+        stream.removeTrack(oldAudio);
+        oldAudio.stop();
+        Native.stopAudio();
+    }
+    if (soundshareEnabled && !stream.getAudioTracks().length) stream.addTrack(loopbackTrack(c.id));
     sourceId = c.id;
-    if (previewVideo) previewVideo.srcObject = c.stream;
-    if (watching?.userId === me()) watching.stream = c.stream;
-    links.forEach((conn, userId) => { if (viewers.has(userId)) addViewer(conn, userId); });
-    old.getTracks().forEach(t => t.stop());
+
+    const kbps = targetKbps();
+    for (const userId of viewers) {
+        const pc = links.get(userId)?.peerConnection;
+        if (pc) setTracks(pc, stream.getTracks()).then(() => tuneSender(pc, kbps)).catch(e => logger.warn("Could not tune the video sender", e));
+    }
     notify();
 }
 
@@ -473,13 +469,17 @@ function attachLink(conn: DataConnection, userId: string) {
         if (prefersExisting(old, conn)) return conn.close();
         links.set(userId, conn);
         if (old !== conn) old?.close();
+        conn.peerConnection.onnegotiationneeded = () => negotiate(conn).catch(e => logger.warn("Could not renegotiate the stream", e));
+        if (viewers.has(userId) && stream) setTracks(conn.peerConnection, stream.getTracks());
         conn.send({ t: "state", viewers: [...viewers.keys()] });
         if (myPreview) conn.send({ t: "preview", img: myPreview });
+        logRoute(conn, userId).catch(() => null);
     });
     conn.on("data", d => {
         if (!isMessage(d) || links.get(userId) !== conn) return;
         if (d.t === "watch") addViewer(conn, userId);
         if (d.t === "unwatch") dropViewer(userId);
+        if (d.t === "sdp") acceptAnswer(conn.peerConnection, d.sdp).catch(e => logger.warn("Could not apply the viewer's answer", e));
     });
     conn.on("close", () => {
         if (links.get(userId) !== conn) return;
@@ -537,8 +537,11 @@ async function share(channelId: string, id: string, name?: string) {
 
     const Peer = await loadPeer();
     const c = Peer && await capture(id, name);
-    if (token !== streamToken) return c?.stream.getTracks().forEach(t => t.stop());
+    if (token !== streamToken) return c?.track.stop();
     if (!Peer || !c) return stopStream();
+
+    const s = new MediaStream([c.track]);
+    if (ApplicationStreamingSettingsStore.getState().soundshareEnabled) s.addTrack(loopbackTrack(c.id));
 
     const p = new Peer(peerId(channelId, me()));
     keepSignaling(p, err => {
@@ -554,9 +557,9 @@ async function share(channelId: string, id: string, name?: string) {
     });
 
     peer = p;
-    stream = c.stream;
+    stream = s;
     sourceId = c.id;
-    startPreviews(c.stream);
+    startPreviews(s);
     notify();
 }
 
@@ -613,6 +616,16 @@ export function interceptStreamActions(action: StreamAction) {
 
 function attachLive(conn: DataConnection, userId: string, channelId: string, preexisting: boolean) {
     closeWhenDead(conn);
+    conn.peerConnection.addEventListener("track", ({ streams: [s] }) => {
+        const l = live.get(userId);
+        if (l?.conn !== conn) return;
+        l.stream = s;
+        if (watching?.userId === userId) {
+            watching.stream = s;
+            watching.ended = false;
+        }
+        notify();
+    });
     conn.on("open", () => {
         const old = live.get(userId);
         if (prefersExisting(old?.conn, conn)) return conn.close();
@@ -620,12 +633,14 @@ function attachLive(conn: DataConnection, userId: string, channelId: string, pre
         if (old && old.conn !== conn) old.conn.close();
         else refresh(userId, channelId);
         notify();
+        logRoute(conn, userId).catch(() => null);
     });
     conn.on("data", d => {
         const l = live.get(userId);
         if (l?.conn !== conn || !isMessage(d)) return;
         if (d.t === "state") l.viewers = d.viewers;
         if (d.t === "preview") l.preview = d.img;
+        if (d.t === "sdp") negotiate(conn, d.sdp).catch(e => logger.warn("Could not answer the stream offer", e));
         notify();
     });
     conn.on("close", () => {
@@ -634,16 +649,17 @@ function attachLive(conn: DataConnection, userId: string, channelId: string, pre
         endWatching(userId);
         refresh(userId, channelId);
         notify();
+        setTimeout(() => probe(userId), 3000);
     });
 }
 
-function probe() {
+function probe(only?: string) {
     if (!watcher || !watcherChannelId) return;
     const w = watcher;
     const channelId = watcherChannelId;
 
     for (const userId of Object.keys(VoiceStateStore.getVoiceStatesForChannel(channelId))) {
-        if (userId === me() || live.has(userId)) continue;
+        if (userId === me() || live.has(userId) || (only && userId !== only)) continue;
         const conn = dial(w, peerId(channelId, userId));
         if (conn) attachLive(conn, userId, channelId, true);
     }
@@ -673,26 +689,15 @@ function createWatcher(Peer: PeerCtor, channelId: string, token: number, named: 
         warned = true;
         setTimeout(() => { if (token === watcherToken) createWatcher(Peer, channelId, token, named); }, 10_000);
     });
-    w.on("open", probe);
+    w.on("open", () => probe());
     w.on("connection", conn => {
         const [prefix, chan, userId] = conn.peer.split("-");
-        if (prefix !== "eqshare" || chan !== channelId || !VoiceStateStore.getVoiceStateForChannel(channelId, userId)) return conn.close();
+        if (prefix !== "eqshare2" || chan !== channelId || !VoiceStateStore.getVoiceStateForChannel(channelId, userId)) return conn.close();
         attachLive(conn, userId, channelId, false);
     });
-    w.on("call", call => {
-        const userId = call.peer.split("-")[2];
-        if (watching?.userId !== userId) return call.close();
-        watchCall = call;
-        call.answer();
-        call.on("stream", s => {
-            if (watching?.userId !== userId) return;
-            watching.stream = s;
-            watching.ended = false;
-            notify();
-        });
-        call.on("close", () => { if (watchCall === call) endWatching(userId); });
-    });
     watcher = w;
+    clearInterval(probeTimer);
+    if (!named) probeTimer = setInterval(() => probe(), 30_000);
 }
 
 async function startWatcher(channelId: string) {
@@ -703,7 +708,6 @@ async function startWatcher(channelId: string) {
 
     createWatcher(Peer, channelId, token, true);
     watcherChannelId = channelId;
-    probeTimer = setInterval(probe, 30_000);
 }
 
 export function onVoiceChannel(channelId: string | null) {
@@ -718,8 +722,8 @@ export function watch(userId: string) {
     if (!channelId || !isLive(userId)) return false;
 
     unwatch();
-    watching = { userId, channelId, stream: userId === me() ? stream : null, ended: false };
     const l = live.get(userId);
+    watching = { userId, channelId, stream: userId === me() ? stream : l?.stream ?? null, ended: false };
     if (l?.conn.open) l.conn.send({ t: "watch" });
     refresh(userId, channelId);
     notify();
@@ -730,8 +734,6 @@ export function unwatch() {
     if (!watching) return false;
     const l = live.get(watching.userId);
     if (l?.conn.open) l.conn.send({ t: "unwatch" });
-    watchCall?.close();
-    watchCall = null;
     refresh(watching.userId, watching.channelId);
     watching = null;
     notify();
